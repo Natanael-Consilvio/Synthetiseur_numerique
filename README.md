@@ -49,3 +49,23 @@ PLL0_CLK_clock <img width="505" height="530" alt="image" src="https://github.com
 
 
 Vous passerez surment pas mal de temps à réussir à faire communiquer le tout, c'est selon moi la chose la plus embêtante car il y a toujours un petit soucis. Il se peut que vous y passier plusieurs heures/jours mais il ne faut pas désesperer. Bon courage <3
+
+Suite à la compilation du CODE 2 sur la carte, voici le roles des différentes molettes : 
+Molette noire 
+•	Rotation → séléctionne l'oscillateur  (OSC 1/2/3)
+•	Clic  → change  l'oscillateur sélectionné
+8 molettes blanches 
+•	M1 → Detune de l'oscillateur sélectionné
+•	M2 → VCF Cutoff global (20 Hz → 10 kHz)
+•	M3 → VCF Résonance globale (0 → 0.95)
+•	M4→ LFO Rate global (0,1 → 20 Hz)
+•	M5 → LFO → Pitch global 
+•	M6→ LFO → Filtre global
+•	M7→ LFO → Gain global
+•	M8→ Volume de l'oscillateur sélectionné
+4 faders (F1 à F4)
+•	F1→ EQ Basses
+•	F2→ EQ Médiums 
+•	F3→ EQ Aigus
+•	F4→ Volume Master 
+
