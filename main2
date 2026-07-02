@@ -1,0 +1,625 @@
+#include "fsl_debug_console.h"
+#include "lvgl_support.h"
+#include "board.h"
+#include "app.h"
+#include "lvgl.h"
+#include "fsl_lpuart.h"
+#include "fsl_sai.h"
+#include "fsl_clock.h"
+#include <math.h>
+#include <stdio.h>
+
+#define MIDI_UART  ((LPUART_Type *) LP_FLEXCOMM3_BASE)
+#define MIDI_IRQn  LP_FLEXCOMM3_IRQn
+
+#define DEMO_SAI_BASE  SAI0
+#define SAMPLE_RATE    48000
+#define BUFFER_SIZE    256
+#define AMPLITUDE      4000.0f
+#define LUT_SIZE       256
+#define MAX_VOICES     6
+#define NUM_OSC        3
+
+#define REVERB_SIZE    24000
+#define DELAY_SIZE     19200
+#define CHORUS_SIZE    2400
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846f
+#endif
+
+#define LVGL_TICK_MS        1U
+#define LVGL_TASK_PERIOD_MS 5U
+
+#define CC_M1_DETUNE     74
+#define CC_M2_CUTOFF     71
+#define CC_M3_RESO       76
+#define CC_M4_LFO_RATE   77
+#define CC_M5_LFO_PITCH  93
+#define CC_M6_LFO_FILT   18
+#define CC_M7_LFO_GAIN   19
+#define CC_M8_VOLUME     16
+#define CC_BLACK_TURN   114
+#define CC_BLACK_CLICK  115
+#define CC_F1_BASS       82
+#define CC_F2_MID        83
+#define CC_F3_TREBLE     85
+#define CC_F4_MASTER_VOL 17
+
+typedef struct {
+    float   detune;
+    float   volume;
+    uint8_t wave_mode;
+} OscParams;
+
+typedef enum {
+    ENV_IDLE = 0,
+    ENV_ATTACK,
+    ENV_DECAY,
+    ENV_SUSTAIN,
+    ENV_RELEASE
+} EnvState;
+
+typedef struct {
+    uint8_t  active;
+    uint8_t  midi_note;
+    float    base_freq;
+    float    phase[NUM_OSC];
+    EnvState env_state;
+    float    env_val;
+} Voice;
+
+typedef enum { MODE_EASY, MODE_PRO } EffectMode;
+
+static volatile uint32_t s_tick        = 0U;
+static volatile bool     s_lvglPending = false;
+
+float sinus_lut[LUT_SIZE];
+uint32_t audio_buffer[BUFFER_SIZE];
+
+OscParams osc[NUM_OSC];
+Voice     voices[MAX_VOICES];
+volatile int selected_osc = 0;
+
+volatile float p_attack  = 0.05f;
+volatile float p_decay   = 0.15f;
+volatile float p_sustain = 0.70f;
+volatile float p_release = 0.40f;
+
+volatile float g_cutoff = 8000.0f, g_resonance = 0.0f;
+volatile float g_lfo_rate = 1.0f, g_lfo_pitch = 0.0f;
+volatile float g_lfo_filtre = 0.0f, g_lfo_gain = 0.0f;
+float g_lfo_phase = 0.0f, svf_low = 0.0f, svf_band = 0.0f;
+
+volatile float master_volume = 0.8f;
+volatile float eq_bass = 1.0f, eq_mid = 1.0f, eq_treble = 1.0f;
+float eq_state_lp = 0.0f, eq_state_hp = 0.0f;
+
+uint8_t midi_status = 0, midi_note = 0, midi_velocity = 0, midi_index = 0;
+
+static float reverb_buf[REVERB_SIZE];
+static float delay_buf[DELAY_SIZE];
+static float chorus_buf[CHORUS_SIZE];
+static uint32_t reverb_ptr = 0, delay_ptr = 0, chorus_ptr = 0;
+static float chorus_lfo_phase = 0.0f;
+
+volatile EffectMode g_effect_mode   = MODE_EASY;
+volatile uint8_t    g_eff_param[3]  = {0, 0, 0};
+
+static lv_obj_t *lbl_osc_sel = NULL;
+static lv_obj_t *tab_eff     = NULL;
+
+static void effect_param_cb(lv_event_t *e) {
+    uint32_t i = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
+    g_eff_param[i] = (uint8_t)lv_slider_get_value(lv_event_get_target(e));
+}
+
+static void Apply_Effects(float *s) {
+    float p0 = (float)g_eff_param[0] / 100.0f;
+    float p1 = (float)g_eff_param[1] / 100.0f;
+    float p2 = (float)g_eff_param[2] / 100.0f;
+
+    if (g_effect_mode == MODE_EASY) {
+        if (p0 > 0.01f) {
+            float decay = p0 * 0.6f;
+            float d = reverb_buf[reverb_ptr];
+            reverb_buf[reverb_ptr] = (*s) + d * decay;
+            *s = (*s) * (1.0f - p0 * 0.3f) + d * (p0 * 0.3f);
+            reverb_ptr = (reverb_ptr + 1) % REVERB_SIZE;
+        }
+        if (p1 > 0.01f) {
+            uint32_t delay_120ms = (uint32_t)(0.120f * SAMPLE_RATE);
+            uint32_t rd = (delay_ptr + DELAY_SIZE - delay_120ms) % DELAY_SIZE;
+            delay_buf[delay_ptr] = *s;
+            *s = (*s) * (1.0f - p1 * 0.4f) + delay_buf[rd] * (p1 * 0.4f);
+            delay_ptr = (delay_ptr + 1) % DELAY_SIZE;
+
+            float clfo = sinf(chorus_lfo_phase);
+            chorus_lfo_phase += 2.0f * M_PI * 0.5f / (float)SAMPLE_RATE;
+            if (chorus_lfo_phase >= 2.0f * M_PI) chorus_lfo_phase -= 2.0f * M_PI;
+            uint32_t cdepth = (uint32_t)(20 + clfo * 15.0f);
+            uint32_t crd = (chorus_ptr + CHORUS_SIZE - cdepth) % CHORUS_SIZE;
+            chorus_buf[chorus_ptr] = *s;
+            *s = (*s) * 0.7f + chorus_buf[crd] * (p1 * 0.3f);
+            chorus_ptr = (chorus_ptr + 1) % CHORUS_SIZE;
+        }
+        if (p2 > 0.01f) {
+            static float bril_phase = 0.0f;
+            bril_phase += 2.0f * M_PI * 6.0f / (float)SAMPLE_RATE;
+            if (bril_phase >= 2.0f * M_PI) bril_phase -= 2.0f * M_PI;
+            float trem = 1.0f - p2 * 0.4f * (0.5f + 0.5f * sinf(bril_phase));
+            *s *= trem;
+        }
+    } else {
+        if (p0 > 0.01f) {
+            float decay = p0 * 0.88f;
+            float d = reverb_buf[reverb_ptr];
+            reverb_buf[reverb_ptr] = (*s) + d * decay;
+            *s = (*s) * 0.6f + d * (p0 * 0.4f);
+            reverb_ptr = (reverb_ptr + 1) % REVERB_SIZE;
+        }
+        if (p1 > 0.01f) {
+            uint32_t delay_300ms = (uint32_t)(0.300f * SAMPLE_RATE);
+            uint32_t rd = (delay_ptr + DELAY_SIZE - delay_300ms) % DELAY_SIZE;
+            float d = delay_buf[rd];
+            delay_buf[delay_ptr] = (*s) + d * (p1 * 0.7f);
+            *s = (*s) * (1.0f - p1 * 0.5f) + d * (p1 * 0.5f);
+            delay_ptr = (delay_ptr + 1) % DELAY_SIZE;
+        }
+        if (p2 > 0.01f) {
+            float clfo = sinf(chorus_lfo_phase);
+            chorus_lfo_phase += 2.0f * M_PI * 1.2f / (float)SAMPLE_RATE;
+            if (chorus_lfo_phase >= 2.0f * M_PI) chorus_lfo_phase -= 2.0f * M_PI;
+            uint32_t cdepth = (uint32_t)(40 + clfo * 30.0f * p2);
+            if (cdepth >= CHORUS_SIZE) cdepth = CHORUS_SIZE - 1;
+            uint32_t crd = (chorus_ptr + CHORUS_SIZE - cdepth) % CHORUS_SIZE;
+            chorus_buf[chorus_ptr] = *s;
+            *s = (*s) * 0.6f + chorus_buf[crd] * (p2 * 0.4f);
+            chorus_ptr = (chorus_ptr + 1) % CHORUS_SIZE;
+        }
+    }
+}
+
+void Note_On(uint8_t note) {
+    for (int i = 0; i < MAX_VOICES; i++) {
+        if (voices[i].active && voices[i].midi_note == note) {
+            voices[i].env_state = ENV_ATTACK;
+            return;
+        }
+    }
+    for (int i = 0; i < MAX_VOICES; i++) {
+        if (!voices[i].active) {
+            voices[i].midi_note = note;
+            voices[i].base_freq = 440.0f * powf(2.0f, ((float)note - 69.0f) / 12.0f);
+            for (int o = 0; o < NUM_OSC; o++) voices[i].phase[o] = 0.0f;
+            voices[i].env_state = ENV_ATTACK;
+            voices[i].env_val = 0.0f;
+            voices[i].active = 1;
+            return;
+        }
+    }
+    voices[0].midi_note = note;
+    voices[0].base_freq = 440.0f * powf(2.0f, ((float)note - 69.0f) / 12.0f);
+    for (int o = 0; o < NUM_OSC; o++) voices[0].phase[o] = 0.0f;
+    voices[0].env_state = ENV_ATTACK;
+    voices[0].env_val = 0.0f;
+    voices[0].active = 1;
+}
+
+void Note_Off(uint8_t note) {
+    for (int i = 0; i < MAX_VOICES; i++) {
+        if (voices[i].midi_note == note && voices[i].active) {
+            voices[i].env_state = ENV_RELEASE;
+        }
+    }
+}
+
+void Apply_Knob(uint8_t cc, uint8_t value) {
+    float kv = (float)value / 127.0f;
+    switch (cc) {
+        case CC_M1_DETUNE:
+            if (value == 64) {
+                osc[selected_osc].detune = 0.0f;
+            } else if (value > 64) {
+                osc[selected_osc].detune = ((float)value - 64.0f) * (24.0f / 63.0f);
+            } else {
+                osc[selected_osc].detune = ((float)value - 64.0f) * (24.0f / 64.0f);
+            }
+            break;
+        case CC_M8_VOLUME:    osc[selected_osc].volume = kv;                   break;
+        case CC_M2_CUTOFF:    g_cutoff     = 20.0f * powf(2.0f, kv * 9.0f);   break;
+        case CC_M3_RESO:      g_resonance  = kv * 0.95f;                       break;
+        case CC_M4_LFO_RATE:  g_lfo_rate   = 0.1f + kv * 20.0f;               break;
+        case CC_M5_LFO_PITCH: g_lfo_pitch  = kv * 2.0f;                       break;
+        case CC_M6_LFO_FILT:  g_lfo_filtre = kv * 5000.0f;                    break;
+        case CC_M7_LFO_GAIN:  g_lfo_gain   = kv;                               break;
+        default: break;
+    }
+}
+
+void Update_Osc_Label(void) {
+    if (lbl_osc_sel != NULL) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "OSC actif : %d  (M1=Detune  M8=Volume)", selected_osc + 1);
+        lv_label_set_text(lbl_osc_sel, buf);
+    }
+}
+
+void Process_MIDI_Byte(uint8_t byte) {
+    if (byte >= 0xF8) return;
+    if (byte & 0x80) {
+        uint8_t cmd = byte & 0xF0;
+        if (cmd == 0x90 || cmd == 0x80 || cmd == 0xB0) {
+            midi_status = byte; midi_index = 0;
+        } else {
+            midi_status = 0;
+        }
+        return;
+    }
+    if (!midi_status) return;
+    if (midi_index == 0) {
+        midi_note = byte; midi_index = 1;
+    } else {
+        midi_velocity = byte; midi_index = 0;
+        uint8_t cmd = midi_status & 0xF0;
+        if (cmd == 0x90 && midi_velocity > 0) {
+            Note_On(midi_note);
+        } else if (cmd == 0x80 || (cmd == 0x90 && midi_velocity == 0)) {
+            Note_Off(midi_note);
+        } else if (cmd == 0xB0) {
+            float kv = (float)midi_velocity / 127.0f;
+            if      (midi_note == CC_F1_BASS)       eq_bass       = kv * 3.0f;
+            else if (midi_note == CC_F2_MID)        eq_mid        = kv * 3.0f;
+            else if (midi_note == CC_F3_TREBLE)     eq_treble     = kv * 4.0f;
+            else if (midi_note == CC_F4_MASTER_VOL) master_volume = kv;
+            else if (midi_note == CC_BLACK_CLICK && midi_velocity > 0) {
+                selected_osc = (selected_osc + 1) % NUM_OSC;
+                Update_Osc_Label();
+            } else if (midi_note == CC_BLACK_TURN) {
+                selected_osc = (midi_velocity > 64)
+                    ? (selected_osc + NUM_OSC - 1) % NUM_OSC
+                    : (selected_osc + 1) % NUM_OSC;
+                Update_Osc_Label();
+            } else {
+                Apply_Knob(midi_note, midi_velocity);
+            }
+        }
+    }
+}
+
+void MIDI_Poll(void) {
+    uint32_t flags = LPUART_GetStatusFlags(MIDI_UART);
+    if (flags & (kLPUART_RxOverrunFlag | kLPUART_NoiseErrorFlag | kLPUART_FramingErrorFlag)) {
+        LPUART_ClearStatusFlags(MIDI_UART, kLPUART_RxOverrunFlag | kLPUART_NoiseErrorFlag | kLPUART_FramingErrorFlag);
+        LPUART_ReadByte(MIDI_UART);
+        midi_status = 0; midi_index = 0;
+    }
+    while (LPUART_GetStatusFlags(MIDI_UART) & kLPUART_RxDataRegFullFlag) {
+        Process_MIDI_Byte(LPUART_ReadByte(MIDI_UART));
+    }
+}
+
+void Generate_Audio_Chunk(uint32_t *buffer, uint32_t size) {
+    uint32_t li = (uint32_t)(g_lfo_phase * (float)LUT_SIZE);
+    if (li >= LUT_SIZE) li = 0;
+    float lfo = sinus_lut[li];
+    g_lfo_phase += g_lfo_rate * (float)size / (float)SAMPLE_RATE;
+    if (g_lfo_phase >= 1.0f) g_lfo_phase -= 1.0f;
+
+    float factor[NUM_OSC], vol[NUM_OSC];
+    uint8_t wmode[NUM_OSC];
+    for (int o = 0; o < NUM_OSC; o++) {
+        factor[o] = powf(2.0f, (osc[o].detune + g_lfo_pitch * lfo) / 12.0f);
+        vol[o]    = osc[o].volume;
+        wmode[o]  = osc[o].wave_mode;
+    }
+
+    float cutoff = g_cutoff + g_lfo_filtre * lfo;
+    if (cutoff < 20.0f)   cutoff = 20.0f;
+    if (cutoff > 8000.0f) cutoff = 8000.0f;
+
+    float f1 = 2.0f * sinf(M_PI * cutoff / (float)SAMPLE_RATE);
+    if (f1 > 0.8f) f1 = 0.8f;
+    float q1 = 2.0f * (1.0f - g_resonance);
+    if (q1 < 0.10f) q1 = 0.10f;
+
+    float gainmod = 1.0f - (g_lfo_gain * 0.5f * (1.0f + lfo));
+    float att_inc = 1.0f / (p_attack * (float)SAMPLE_RATE);
+    float dec_dec = (1.0f - p_sustain) / (p_decay * (float)SAMPLE_RATE);
+    float rel_dec = 1.0f / (p_release * (float)SAMPLE_RATE);
+
+    for (uint32_t i = 0; i < size; i++) {
+        float mixed_raw = 0.0f;
+        for (int v = 0; v < MAX_VOICES; v++) {
+            if (!voices[v].active) continue;
+
+            switch (voices[v].env_state) {
+                case ENV_ATTACK:
+                    voices[v].env_val += att_inc;
+                    if (voices[v].env_val >= 1.0f) {
+                        voices[v].env_val = 1.0f;
+                        voices[v].env_state = ENV_DECAY;
+                    }
+                    break;
+                case ENV_DECAY:
+                    voices[v].env_val -= dec_dec;
+                    if (voices[v].env_val <= p_sustain) {
+                        voices[v].env_val = p_sustain;
+                        voices[v].env_state = ENV_SUSTAIN;
+                    }
+                    break;
+                case ENV_SUSTAIN:
+                    voices[v].env_val = p_sustain;
+                    break;
+                case ENV_RELEASE:
+                    voices[v].env_val -= rel_dec;
+                    if (voices[v].env_val <= 0.0f) {
+                        voices[v].env_val = 0.0f;
+                        voices[v].env_state = ENV_IDLE;
+                        voices[v].active = 0;
+                    }
+                    break;
+                default:
+                    break;
+            }
+
+            if (!voices[v].active) continue;
+
+            float voice_mix = 0.0f;
+            for (int o = 0; o < NUM_OSC; o++) {
+                float ph = voices[v].phase[o];
+                float raw;
+                switch (wmode[o]) {
+                    case 1:  raw = (ph < 0.5f) ? 1.0f : -1.0f; break;
+                    case 2:  raw = (2.0f * ph) - 1.0f;         break;
+                    default: {
+                        uint32_t idx = (uint32_t)(ph * (float)LUT_SIZE);
+                        if (idx >= LUT_SIZE) idx = 0;
+                        raw = sinus_lut[idx];
+                    } break;
+                }
+                voices[v].phase[o] = ph + (voices[v].base_freq * factor[o]) / (float)SAMPLE_RATE;
+                if (voices[v].phase[o] >= 1.0f) voices[v].phase[o] -= 1.0f;
+                voice_mix += raw * vol[o];
+            }
+
+            mixed_raw += voice_mix * voices[v].env_val;
+        }
+
+        float s = 0.0f;
+
+        if (cutoff >= 7900.0f && g_resonance < 0.01f) {
+            s = mixed_raw;
+        } else {
+            if (!(svf_low  >= -100000.0f && svf_low  <= 100000.0f)) svf_low  = 0.0f;
+            if (!(svf_band >= -100000.0f && svf_band <= 100000.0f)) svf_band = 0.0f;
+            svf_low += f1 * svf_band;
+            float high = mixed_raw - svf_low - q1 * svf_band;
+            svf_band += f1 * high;
+            s = svf_low;
+        }
+
+        s *= gainmod;
+        s *= AMPLITUDE;
+
+        eq_state_lp += 0.0327f * (s - eq_state_lp);
+        eq_state_hp += 0.327f  * (s - eq_state_hp);
+        if (!(eq_state_lp >= -100000.0f && eq_state_lp <= 100000.0f)) eq_state_lp = 0.0f;
+        if (!(eq_state_hp >= -100000.0f && eq_state_hp <= 100000.0f)) eq_state_hp = 0.0f;
+        s = (eq_state_lp * eq_bass)
+          + ((eq_state_hp - eq_state_lp) * eq_mid)
+          + ((s - eq_state_hp) * eq_treble);
+        s *= master_volume;
+
+        Apply_Effects(&s);
+
+        if (!(s >= -100000.0f && s <= 100000.0f)) s = 0.0f;
+        if (s >  32700.0f) s =  32700.0f;
+        else if (s < -32700.0f) s = -32700.0f;
+        int16_t sv = (int16_t)s;
+        buffer[i] = (uint32_t)((sv << 16) | (uint16_t)sv);
+    }
+}
+
+static void DEMO_SetupTick(void) {
+    if (0 != SysTick_Config(SystemCoreClock / (LVGL_TICK_MS * 1000U)))
+        for (;;) {}
+}
+
+void SysTick_Handler(void) {
+    s_tick++;
+    lv_tick_inc(LVGL_TICK_MS);
+    if ((s_tick % LVGL_TASK_PERIOD_MS) == 0U)
+        s_lvglPending = true;
+}
+
+void print_cb(lv_log_level_t level, const char *buf) {
+    LV_UNUSED(level);
+}
+
+static void osc_wave_cb(lv_event_t *e) {
+    uint32_t i = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
+    osc[i].wave_mode = (uint8_t)lv_dropdown_get_selected(lv_event_get_target(e));
+}
+
+static void osc_vol_cb(lv_event_t *e) {
+    uint32_t i = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
+    osc[i].volume = (float)lv_slider_get_value(lv_event_get_target(e)) / 100.0f;
+}
+
+static void Refresh_Effects_UI(void);
+
+static void mode_switch_cb(lv_event_t *e) {
+    lv_obj_t *sw = lv_event_get_target(e);
+    g_effect_mode = lv_obj_has_state(sw, LV_STATE_CHECKED) ? MODE_PRO : MODE_EASY;
+    Refresh_Effects_UI();
+}
+
+static void Refresh_Effects_UI(void) {
+    if (!tab_eff) return;
+    lv_obj_clean(tab_eff);
+
+    lv_obj_t *row0 = lv_obj_create(tab_eff);
+    lv_obj_set_size(row0, LV_PCT(100), 50);
+    lv_obj_set_flex_flow(row0, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row0, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(row0, 6, 0);
+    lv_obj_set_style_border_width(row0, 0, 0);
+    lv_obj_set_style_bg_opa(row0, LV_OPA_TRANSP, 0);
+
+    lv_obj_t *lbl_m = lv_label_create(row0);
+    lv_label_set_text(lbl_m, g_effect_mode == MODE_PRO ? "Mode PRO" : "Mode EASY");
+    lv_obj_set_style_text_color(lbl_m,
+        g_effect_mode == MODE_PRO ? lv_color_hex(0xff6600) : lv_color_hex(0x00cc88), 0);
+
+    lv_obj_t *sw = lv_switch_create(row0);
+    if (g_effect_mode == MODE_PRO) lv_obj_add_state(sw, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(sw, mode_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    const char *labels_easy[] = {"Chaleur", "Profondeur", "Brillance"};
+    const char *labels_pro[]  = {"Reverb",  "Delay",      "Chorus"};
+    const char **labels = (g_effect_mode == MODE_EASY) ? labels_easy : labels_pro;
+
+    for (int i = 0; i < 3; i++) {
+        lv_obj_t *row = lv_obj_create(tab_eff);
+        lv_obj_set_size(row, LV_PCT(100), 50);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_all(row, 6, 0);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+
+        lv_obj_t *lbl = lv_label_create(row);
+        lv_label_set_text(lbl, labels[i]);
+
+        lv_obj_t *sl = lv_slider_create(row);
+        lv_slider_set_range(sl, 0, 100);
+        lv_slider_set_value(sl, g_eff_param[i], LV_ANIM_OFF);
+        lv_obj_set_width(sl, 200);
+        lv_obj_add_event_cb(sl, effect_param_cb, LV_EVENT_VALUE_CHANGED,
+                            (void *)(uintptr_t)i);
+    }
+}
+
+static void Create_Synth_UI(void) {
+    lv_obj_t *scr = lv_scr_act();
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0x1a1a2e), 0);
+
+    lv_obj_t *tv = lv_tabview_create(scr);
+    lv_obj_set_size(tv, LV_PCT(100), LV_PCT(100));
+
+    lv_obj_t *tab_timbre = lv_tabview_add_tab(tv, "Timbre");
+    lv_obj_set_flex_flow(tab_timbre, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(tab_timbre, 6, 0);
+
+    lbl_osc_sel = lv_label_create(tab_timbre);
+    lv_label_set_text(lbl_osc_sel, "OSC actif : 1  (M1=Detune  M8=Volume)");
+    lv_obj_set_style_text_color(lbl_osc_sel, lv_color_hex(0x00ff88), 0);
+
+    const char *osc_names[] = {"OSC 1", "OSC 2", "OSC 3"};
+
+    for (int i = 0; i < NUM_OSC; i++) {
+        lv_obj_t *row = lv_obj_create(tab_timbre);
+        lv_obj_set_size(row, LV_PCT(100), 55);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_all(row, 4, 0);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+
+        lv_obj_t *lbl = lv_label_create(row);
+        lv_label_set_text(lbl, osc_names[i]);
+
+        lv_obj_t *dd = lv_dropdown_create(row);
+        lv_dropdown_set_options(dd, "Sinus\nCarre\nScie");
+        lv_dropdown_set_selected(dd, osc[i].wave_mode);
+        lv_obj_set_width(dd, 110);
+        lv_obj_add_event_cb(dd, osc_wave_cb, LV_EVENT_VALUE_CHANGED,
+                            (void *)(uintptr_t)i);
+
+        lv_obj_t *sl = lv_slider_create(row);
+        lv_slider_set_range(sl, 0, 100);
+        lv_slider_set_value(sl, (int)(osc[i].volume * 100.0f), LV_ANIM_OFF);
+        lv_obj_set_width(sl, 110);
+        lv_obj_add_event_cb(sl, osc_vol_cb, LV_EVENT_VALUE_CHANGED,
+                            (void *)(uintptr_t)i);
+    }
+
+    tab_eff = lv_tabview_add_tab(tv, "Effets");
+    lv_obj_set_flex_flow(tab_eff, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(tab_eff, 6, 0);
+    Refresh_Effects_UI();
+}
+
+int main(void) {
+    BOARD_InitHardware();
+    DEMO_SetupTick();
+
+    lv_init();
+    lv_port_disp_init();
+    lv_port_indev_init();
+#if LV_USE_LOG
+    lv_log_register_print_cb(print_cb);
+#endif
+
+    for (int i = 0; i < MAX_VOICES; i++) {
+        voices[i].active = 0;
+        voices[i].env_state = ENV_IDLE;
+        voices[i].env_val = 0.0f;
+        for (int o = 0; o < NUM_OSC; o++) voices[i].phase[o] = 0.0f;
+    }
+
+    for (int o = 0; o < NUM_OSC; o++) {
+        osc[o].detune    = 0.0f;
+        osc[o].volume    = (o == 0) ? 0.5f : 0.0f;
+        osc[o].wave_mode = (uint8_t)o;
+    }
+
+    for (int i = 0; i < LUT_SIZE; i++)
+        sinus_lut[i] = sinf((2.0f * M_PI * (float)i) / (float)LUT_SIZE);
+
+    memset(reverb_buf, 0, sizeof(reverb_buf));
+    memset(delay_buf,  0, sizeof(delay_buf));
+    memset(chorus_buf, 0, sizeof(chorus_buf));
+
+    CLOCK_EnableClock(kCLOCK_LPFlexComm3);
+    CLOCK_SetClkDiv(kCLOCK_DivFlexcom3Clk, 1U);
+    CLOCK_AttachClk(kFRO12M_to_FLEXCOMM3);
+
+    lpuart_config_t uartCfg;
+    LPUART_GetDefaultConfig(&uartCfg);
+    uartCfg.baudRate_Bps = 31250U;
+    uartCfg.enableRx = true;
+    uartCfg.enableTx = false;
+    LPUART_Init(MIDI_UART, &uartCfg, 12000000U);
+    MIDI_UART->WATER = (MIDI_UART->WATER & ~LPUART_WATER_RXWATER_MASK) | LPUART_WATER_RXWATER(0);
+    LPUART_DisableInterrupts(MIDI_UART, kLPUART_RxDataRegFullInterruptEnable);
+    DisableIRQ(MIDI_IRQn);
+
+    SAI_Init(DEMO_SAI_BASE);
+    sai_transceiver_t config;
+    SAI_GetClassicI2SConfig(&config, kSAI_WordWidth16bits, kSAI_Stereo, kSAI_Channel0Mask);
+    config.masterSlave = kSAI_Master;
+    config.bitClock.bclkSource = kSAI_BclkSourceBusclk;
+    SAI_TxSetConfig(DEMO_SAI_BASE, &config);
+
+    uint32_t actual_bus_clock = CLOCK_GetFreq(kCLOCK_BusClk);
+    SAI_TxSetBitClockRate(DEMO_SAI_BASE, actual_bus_clock, SAMPLE_RATE, kSAI_WordWidth16bits, 2);
+
+    SAI_TxEnable(DEMO_SAI_BASE, true);
+
+    Create_Synth_UI();
+
+    for (;;) {
+        MIDI_Poll();
+        Generate_Audio_Chunk(audio_buffer, BUFFER_SIZE);
+        SAI_WriteBlocking(DEMO_SAI_BASE, 0, 16, (uint8_t*)audio_buffer, sizeof(audio_buffer));
+
+        if (s_lvglPending) {
+            s_lvglPending = false;
+            lv_timer_handler();
+        }
+    }
+}
